@@ -4,7 +4,7 @@ import os
 from logging import StreamHandler
 from typing import Optional, Union
 
-import numpy as np
+import json
 import pandas as pd
 import torch
 import wandb
@@ -12,21 +12,20 @@ from arguments.training_args import TrainingArguments
 from networks.models import Net
 from setproctitle import setproctitle
 from simple_parsing import ArgumentParser
-from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import RandomSampler, SequentialSampler, random_split
 from trainer.cpu import Trainer
 from utils.comfy import (
     apply_to_collection,
     dataclass_to_namespace,
-    json_to_dict,
     seed_everything,
     tensor_dict_to_device,
-    update_auto_nested_dict,
     web_log_every_n,
 )
 from utils.data.custom_dataloader import CustomDataLoader
 from utils.data.custom_sampler import LengthGroupedSampler
-from utils.data.np_dataset import NumpyDataset
+from utils.data.nlp_dataset import CBOWDataset
+import random
+from collections import defaultdict, deque
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -88,11 +87,21 @@ class CPUTrainer(Trainer):
             batch_idx: index of the current batch w.r.t the current epoch
 
         """
-        # TODO(User): fit the input and output for your model architecture!
-        labels = batch.pop("labels")
+        positive_score, negative_score = model(**batch)
+        positive_pred = self.criterion(positive_score)
+        negative_size = negative_score.size(1)
+        negative_score = torch.sum(negative_score, dim=1) / negative_size
+        negative_pred = self.criterion(negative_score)
 
-        outputs = model(**batch)
-        loss = self.criterion(outputs, labels)
+        eps = torch.tensor(1e-08)
+        # positive의 sigmoid를 최대화 하려면 음의 로그를 작게 만들면 됨
+        positive_loss = -torch.log(positive_pred + eps)
+
+        # 확률 문제에서 정답에 대한 반대(1-정답), negative_sampling 개수를 고려해야 하니까 sum
+        negative_loss = -torch.log((1 - negative_pred) + eps)
+
+        loss = torch.mean(positive_loss + negative_loss)
+        # loss = torch.mean(loss)
 
         def on_before_backward(loss):
             pass
@@ -154,8 +163,7 @@ class CPUTrainer(Trainer):
 
         iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
         eval_step = 0
-        tot_batch_logits = list()
-        tot_batch_labels = list()
+        tot_batch_losses = list()
         for batch_idx, batch in enumerate(iterable):
             tensor_dict_to_device(batch, "cpu", non_blocking=self.non_blocking)
             # end epoch if stopping training completely or max batches for this epoch reached
@@ -167,26 +175,27 @@ class CPUTrainer(Trainer):
 
             on_validation_batch_start(batch, batch_idx)
 
-            # TODO(User): fit the input and output for your model architecture!
-            label = batch.pop("labels")
+            positive_score, negative_score = model(**batch)
 
-            output = model(**batch)
+            positive_pred = self.criterion(positive_score)
+            negative_size = negative_score.size(1)
+            negative_score = torch.sum(negative_score, dim=1) / negative_size
+            negative_pred = self.criterion(negative_score)
 
-            loss = self.criterion(output, label)
+            eps = torch.tensor(1e-08)
+            # positive의 sigmoid를 최대화 하려면 음의 로그를 작게 만들면 됨
+            positive_loss = -torch.log(positive_pred + eps)
 
-            # TODO(User): what do you want to log items every epoch end?
-            tot_batch_logits.append(output)
-            tot_batch_labels.append(label)
+            # 확률 문제에서 정답에 대한 반대(1-정답), negative_sampling 개수를 고려해야 하니까 sum
+            negative_loss = -torch.log((1 - negative_pred) + eps)
+
+            loss = torch.mean(positive_loss + negative_loss)
 
             log_output = {"loss": loss}
             # avoid gradients in stored/accumulated values -> prevents potential OOM
             self._current_val_return = apply_to_collection(log_output, torch.Tensor, lambda x: x.detach())
 
-            def on_validation_batch_end(eval_out, batch, batch_idx):
-                pass
-
-            on_validation_batch_end(output, batch, batch_idx)
-
+            tot_batch_losses.append(self._current_val_return["loss"])
             web_log_every_n(
                 self.web_logger,
                 {
@@ -202,17 +211,15 @@ class CPUTrainer(Trainer):
             eval_step += 1
 
         # TODO(User): Create any form you want to output to wandb!
-        def on_validation_epoch_end(tot_batch_logits, tot_batch_labels):
-            tot_batch_logits = torch.cat(tot_batch_logits, dim=0)
-            tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
-            epoch_loss = self.criterion(tot_batch_logits, tot_batch_labels)
-            epoch_rmse = torch.sqrt(epoch_loss)
+        def on_validation_epoch_end(tot_batch_losses):
+            tot_batch_losses = torch.stack(tot_batch_losses, dim=0)
+            epoch_loss = torch.mean(tot_batch_losses)
             # epoch monitoring is must doing every epoch
             web_log_every_n(
-                self.web_logger, {"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch}, self.current_epoch, 1
+                self.web_logger, {"eval/loss": epoch_loss, "eval/epoch": self.current_epoch}, self.current_epoch, 1
             )
 
-        on_validation_epoch_end(tot_batch_logits, tot_batch_labels)
+        on_validation_epoch_end(tot_batch_losses)
 
         def on_validation_model_train(model):
             torch.set_grad_enabled(True)
@@ -227,81 +234,63 @@ def main(hparams: TrainingArguments):
     web_logger = wandb.init(config=hparams)
     seed_everything(hparams.seed)
 
-    df_train = pd.read_csv(hparams.train_datasets_path, header=0, encoding="utf-8")
-    # Kaggle author Test Final RMSE: 0.06539
-    df_eval = pd.read_csv(hparams.eval_datasets_path, header=0, encoding="utf-8")
+    tot_dataset = pd.read_csv(hparams.train_datasets_path, header=0, encoding="utf-8")
+    train_dataset = tot_dataset[tot_dataset["split"] == "train"]
+    eval_dataset = tot_dataset[tot_dataset["split"] == "val"]
+    logger.info(tot_dataset.head())
 
-    df_train_scaled = df_train.copy()
-    df_test_scaled = df_eval.copy()
+    with open("raw_data/500_vocab.json", "r") as st_json:
+        tokenizer = json.load(st_json)
 
-    # Define the mapping dictionary
-    mapping = {"NE": 0, "SE": 1, "NW": 2, "cv": 3}
+    with open("raw_data/500_train_cnt.json", "r") as st_json:
+        train_counter = json.load(st_json)
+    with open("raw_data/500_eval_cnt.json", "r") as st_json:
+        eval_counter = json.load(st_json)
 
-    # Replace the string values with numerical values
-    df_train_scaled["wnd_dir"] = df_train_scaled["wnd_dir"].map(mapping)
-    df_test_scaled["wnd_dir"] = df_test_scaled["wnd_dir"].map(mapping)
+    negative_sample_n = hparams.negative_sample_n
+    window_size = hparams.window_size
 
-    df_train_scaled["date"] = pd.to_datetime(df_train_scaled["date"])
-    # Resetting the index
-    df_train_scaled.set_index("date", inplace=True)
-    logger.info(df_train_scaled.head())
+    def preprocess(example, subsample_freq, negative_list):
+        context = example["context"].split()
+        input_ids = list()
+        # q = deque(context)
+        # while len(input_ids) < window_size * 2 - 1:
+        # token = q.popleft()
+        # if random.uniform(0, 1) >= subsample_freq[token]:
+        input_ids = [tokenizer[token] for token in context]
+        # else:
+        # q.append(token)
+        if negative_list and negative_sample_n > 0:
+            negative_tokens = list()
+            weights = list()
+            for token, weight in negative_list:
+                negative_tokens.append(token)
+                weights.append(weight)
+            negative_samples = list()
+            visited = defaultdict(lambda: False)
+            while True:
+                if len(negative_samples) == negative_sample_n:
+                    break
+                else:
+                    random_token = random.choices(negative_tokens, weights=weights, k=1)[0]
+                    if (
+                        example["context"].find(random_token) == -1
+                        and example["target"].find(random_token) == -1
+                        and not visited[random_token]
+                    ):
+                        negative_samples.append(random_token)
+                        visited[random_token] = True
+            example["negative_samples"] = [tokenizer[token] for token in negative_samples]
+        labels = [tokenizer[token] for token in example["target"].split()]
+        example["input_ids"] = input_ids
+        example["labels"] = labels
+        return example
 
-    scaler = MinMaxScaler()
-
-    # Define the columns to scale
-    columns = ["pollution", "dew", "temp", "press", "wnd_dir", "wnd_spd", "snow", "rain"]
-
-    df_test_scaled = df_test_scaled[columns]
-
-    # Scale the selected columns to the range 0-1
-    df_train_scaled[columns] = scaler.fit_transform(df_train_scaled[columns])
-    df_test_scaled[columns] = scaler.transform(df_test_scaled[columns])
-
-    # Show the scaled data
-    logger.info(df_train_scaled.head())
-
-    df_train_scaled = np.array(df_train_scaled)
-    df_test_scaled = np.array(df_test_scaled)
-
-    x = []
-    y = []
-    n_future = 1
-    n_past = 11
-
-    #  Train Sets
-    for i in range(n_past, len(df_train_scaled) - n_future + 1):
-        x.append(df_train_scaled[i - n_past : i, 1 : df_train_scaled.shape[1]])
-        y.append(df_train_scaled[i + n_future - 1 : i + n_future, 0])
-    x_train, y_train = np.array(x), np.array(y)
-
-    #  Test Sets
-    x = []
-    y = []
-    for i in range(n_past, len(df_test_scaled) - n_future + 1):
-        x.append(df_test_scaled[i - n_past : i, 1 : df_test_scaled.shape[1]])
-        y.append(df_test_scaled[i + n_future - 1 : i + n_future, 0])
-    x_test, y_test = np.array(x), np.array(y)
-
-    logger.info(
-        "X_train shape : {}   y_train shape : {} \n"
-        "X_test shape : {}      y_test shape : {} ".format(x_train.shape, y_train.shape, x_test.shape, y_test.shape)
-    )
-
-    train_dataset = NumpyDataset(
-        x_train,
-        y_train,
-        feature_column_name=hparams.feature_column_name,
-        labels_column_name=hparams.labels_column_name,
-    )
-    eval_dataset = NumpyDataset(
-        x_test,
-        y_test,
-        feature_column_name=hparams.feature_column_name,
-        labels_column_name=hparams.labels_column_name,
-    )
+    train_dataset = CBOWDataset(train_dataset, train_counter, transform=preprocess)
+    eval_dataset = CBOWDataset(eval_dataset, eval_counter, transform=preprocess)
 
     # Instantiate objects
-    model = Net()
+    model = Net(vocab_size=len(tokenizer.keys()), embedding_size=512)
     web_logger.watch(model, log_freq=hparams.log_every_n)
 
     optimizer = torch.optim.AdamW(
@@ -313,32 +302,12 @@ def main(hparams: TrainingArguments):
     )
 
     generator = None
-    if hparams.sampler_shuffle:
-        generator = torch.Generator()
-        generator.manual_seed(hparams.seed)
-    if hparams.group_by_length:
-        custom_train_sampler = LengthGroupedSampler(
-            batch_size=hparams.per_device_train_batch_size,
-            dataset=train_dataset,
-            model_input_name=train_dataset.length_column_name,
-            generator=generator,
-        )
-        custom_eval_sampler = LengthGroupedSampler(
-            batch_size=hparams.per_device_eval_batch_size,
-            dataset=eval_dataset,
-            model_input_name=eval_dataset.length_column_name,
-        )
-    else:
-        # custom_train_sampler = SequentialSampler(train_dataset)
-        custom_eval_sampler = SequentialSampler(eval_dataset)
-        custom_train_sampler = RandomSampler(train_dataset, generator=generator)
-        # custom_eval_sampler = RandomSampler(eval_dataset, generator=generator)
+    custom_train_sampler = RandomSampler(train_dataset, generator=generator)
+    custom_eval_sampler = SequentialSampler(eval_dataset)
 
     # If 1 device for training, sampler suffle True and dataloader shuffle True is same meaning
     train_dataloader = CustomDataLoader(
         dataset=train_dataset,
-        feature_column_name=hparams.feature_column_name,
-        labels_column_name=hparams.labels_column_name,
         batch_size=hparams.per_device_train_batch_size,
         sampler=custom_train_sampler,
         num_workers=hparams.num_workers,
@@ -347,8 +316,6 @@ def main(hparams: TrainingArguments):
 
     eval_dataloader = CustomDataLoader(
         dataset=eval_dataset,
-        feature_column_name=hparams.feature_column_name,
-        labels_column_name=hparams.labels_column_name,
         batch_size=hparams.per_device_eval_batch_size,
         sampler=custom_eval_sampler,
         num_workers=hparams.num_workers,
@@ -371,7 +338,7 @@ def main(hparams: TrainingArguments):
     # monitor: ReduceLROnPlateau scheduler is stepped using loss, so monitor input train or val loss
     lr_scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1, "monitor": None}
     assert id(scheduler) == id(lr_scheduler["scheduler"])
-    criterion = torch.nn.MSELoss()
+    criterion = torch.nn.Sigmoid()
     trainable_loss = None
 
     # I think some addr is same into trainer init&fit respectfully

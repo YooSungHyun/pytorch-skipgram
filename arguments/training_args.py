@@ -27,20 +27,13 @@ class TrainingArguments:
     per_device_train_batch_size: int = 1  # The batch size per GPU/TPU core/CPU for training.
     per_device_eval_batch_size: int = 1  # The batch size per GPU/TPU core/CPU for evaluation.
     dropout_p: float = 0.0  # Drop path rate (default: 0.0)
-    cutoff_epoch: int = 0  # if drop_mode is early / late, this is the epoch where dropout ends / starts
-    drop_mode: str = sp.field(default="standard", choices=["standard", "early", "late"])  # drop mode
-    drop_schedule: str = sp.field(
-        default="constant", choices=["constant", "linear"]
-    )  # drop schedule for early dropout / s.d. only
     group_by_length: bool = False
     accumulate_grad_batches: int = 1
     max_epochs: int = 1
     log_every_n: int = 1
-    length_column_name: str = None
-    feature_column_name: str = "raw_inputs"
-    labels_column_name: str = "raw_labels"
     dataloader_drop_last: bool = False
     sampler_shuffle: bool = True
     max_norm: float = 0.0  # gradient clipping max_norm value
     model_dtype: str = "fp32"
-    fsdp_config: str = "./fsdp_config/config.json"
+    negative_sample_n: int = 10
+    window_size: int = 2

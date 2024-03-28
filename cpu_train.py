@@ -252,14 +252,23 @@ def main(hparams: TrainingArguments):
 
     def preprocess(example, subsample_freq, negative_list):
         context = example["context"].split()
-        input_ids = list()
-        # q = deque(context)
-        # while len(input_ids) < window_size * 2 - 1:
-        # token = q.popleft()
-        # if random.uniform(0, 1) >= subsample_freq[token]:
+        # 현재 중 max부터 빼는걸 고려하되, 특정 확률에 걸리면 빼자
+        # subsampling freq을 구현했는데, pad token 안넣어서 현재 쓰지 않고, dropout으로 대체
+        # temp_token = defaultdict(lambda: False)
+        # for token in context:
+        #     if random.uniform(0, 1) > subsample_freq[token]:
+        #         temp_token[token] = True
+        # if len(temp_token) < window_size:
+        #     not_in_temp = list(set(context) - set(temp_token))
+        #     plus_token = random.choices(not_in_temp, k=window_size - len(temp_token))
+        #     for token in plus_token:
+        #         temp_token[token] = True
+        # final_context = list()
+        # for token in context:
+        #     if temp_token[token]:
+        #         final_context.append(token)
+        # input_ids = [tokenizer[token] for token in final_context]
         input_ids = [tokenizer[token] for token in context]
-        # else:
-        # q.append(token)
         if negative_list and negative_sample_n > 0:
             negative_tokens = list()
             weights = list()
@@ -282,8 +291,8 @@ def main(hparams: TrainingArguments):
                         visited[random_token] = True
             example["negative_samples"] = [tokenizer[token] for token in negative_samples]
         labels = [tokenizer[token] for token in example["target"].split()]
-        example["input_ids"] = input_ids
-        example["labels"] = labels
+        example["input_ids"] = labels
+        example["labels"] = input_ids
         return example
 
     train_dataset = CBOWDataset(train_dataset, train_counter, transform=preprocess)
